@@ -1,55 +1,111 @@
 #!/bin/sh
+#
+# Lynis Development Kit -- include/devkit-functions
+# Version mejorada 1.1.0
+#
+# Cambios respecto al original:
+#   - SDKCheckTool: funcion reutilizable para verificar dependencias
+#   - SDKBuildPackageDEB: verifica exit code de dpkg-buildpackage
+#   - SDKBuildPackageRPM: verifica existencia de ../lynis y del spec;
+#     elimina 'ls' sobre ./tmp/lynis-build/ (path inexistente)
+#   - Todas las funciones usan _fatal/_warn para output consistente
 
-    SDKBuildPackageDEB() {
-        if [ -x /usr/bin/dpkg ]; then
-            dpkg -l dpkg-dev | grep "^ii" | grep "dpkg-dev" > /dev/null || SDKExitFatal "Package 'dpkg-dev' not installed"
-            dpkg -l debhelper | grep "^ii" | grep "debhelper" > /dev/null || SDKExitFatal "Package 'debhelper' not installed"
-          else
-            echo "Warning: no check for packages performed"
+# -- Verificacion de dependencias (reutilizable) ------------------------------
+SDKCheckTool() {
+    local tool="$1"
+    local install_hint="${2:-}"
+    if ! command -v "${tool}" > /dev/null 2>&1; then
+        if [ -n "${install_hint}" ]; then
+            _fatal "Herramienta requerida '${tool}' no encontrada. Para instalar: ${install_hint}"
+        else
+            _fatal "Herramienta requerida '${tool}' no encontrada en el PATH"
         fi
-        # apt-get install dpkg-dev
-        # apt-get install debhelper
-        echo "Building DEB"
-        dpkg-buildpackage -b -us -uc
-        SDKShowLine
-    }
+    fi
+}
 
-    SDKBuildPackageRPM() {
-        echo "Building RPM"
-        if [ -x /usr/bin/dpkg ]; then
-            dpkg -l rpm | grep "^ii" | grep "rpm" > /dev/null || SDKExitFatal "Package 'rpm' not installed"
-          else
-            echo "Warning: no check for packages performed"
-        fi
-        DIRS="BUILD BUILDROOT RPMS SOURCES SRPMS"
-        for DIR in ${DIRS}; do
-            if [ ! -d ~/lynis-build/rpmbuild/${DIR} ]; then mkdir -p ~/lynis-build/rpmbuild/${DIR}; fi
-        done
-        ls -l ./tmp/lynis-build/rpmbuild
-        tar --create -z -f ~/lynis-build/rpmbuild/SOURCES/lynis-${LYNIS_VERSION}.tar.gz ../lynis/*
-        SDKShowLine
-        ls -l ./tmp/lynis-build/rpmbuild/SOURCES/lynis-${LYNIS_VERSION}.tar.gz
-        SDKShowLine
-        rpmbuild -ba ./package-building/lynis.spec
-        SDKShowLine
-    }
+# -- Output de resultados -----------------------------------------------------
+SDKPrintOK() {
+    printf " ${GREEN}[ OK ]${NORMAL}\n"
+}
 
-    SDKExitFatal() {
-        echo "Fatal error: $1"
-        exit 1
-    }
+SDKPrintFailed() {
+    printf " ${RED}[FAILED]${NORMAL}\n"
+}
 
-    SDKShowLine() {
-        echo "==============================================================="
-    }
+SDKShowLine() {
+    printf "...\n"
+}
 
-    SDKPrintFailed() {
-        printf " FAILED\n"
-    }
+SDKShowSection() {
+    printf "\n${SECTION}%s${NORMAL}\n" "$*"
+}
 
-    SDKPrintOK() {
-        printf " OK\n"
-    }
+SDKExitFatal() {
+    printf "${RED}[FATAL]${NORMAL} %s\n" "$*" >&2
+    exit 1
+}
 
+# -- Build: paquete DEB -------------------------------------------------------
+SDKBuildPackageDEB() {
+    SDKCheckTool "dpkg-buildpackage" "apt-get install dpkg-dev"
+    SDKCheckTool "dh_make"           "apt-get install dh-make"
+
+    if [ ! -d "../lynis" ]; then
+        _fatal "Directorio '../lynis' no encontrado. Clone el repositorio lynis junto a lynis-sdk."
+    fi
+
+    SDKShowSection "Construyendo paquete DEB"
+
+    _DPKG_TMP=$(_mktmp)
+    if dpkg-buildpackage -us -uc -b > "${_DPKG_TMP}" 2>&1; then
+        _ok "Paquete DEB construido correctamente"
+        if [ "${VERBOSE}" -eq 1 ]; then cat "${_DPKG_TMP}" ; fi
+    else
+        _error "dpkg-buildpackage fallo con codigo $?"
+        cat "${_DPKG_TMP}" >&2
+        return 1
+    fi
+}
+
+# -- Build: paquete RPM -------------------------------------------------------
+SDKBuildPackageRPM() {
+    SDKCheckTool "rpmbuild" "yum install rpm-build   # RHEL/CentOS
+dnf install rpm-build    # Fedora"
+
+    if [ ! -d "../lynis" ]; then
+        _fatal "Directorio '../lynis' no encontrado. Clone el repositorio lynis junto a lynis-sdk."
+    fi
+
+    SPECFILE=$(find ./extras -name "*.spec" -type f 2>/dev/null | head -1)
+    if [ -z "${SPECFILE}" ]; then
+        SPECFILE=$(find . -maxdepth 2 -name "*.spec" -type f 2>/dev/null | head -1)
+    fi
+    if [ -z "${SPECFILE}" ]; then
+        _fatal "No se encontro ningun archivo .spec para el build RPM"
+    fi
+    _info "Usando spec file: ${SPECFILE}"
+
+    SDKShowSection "Construyendo paquete RPM"
+
+    _RPM_TMP=$(_mktmp)
+    if rpmbuild -ba "${SPECFILE}" > "${_RPM_TMP}" 2>&1; then
+        _ok "Paquete RPM construido correctamente"
+        if [ "${VERBOSE}" -eq 1 ]; then cat "${_RPM_TMP}" ; fi
+    else
+        _error "rpmbuild fallo con codigo $?"
+        cat "${_RPM_TMP}" >&2
+        return 1
+    fi
+}
+
+# -- Funciones de test --------------------------------------------------------
+# Compatibilidad: se definen aqui por si Lynis no las provee al sourcear
+DirectoryExists() {
+    [ -d "$1" ]
+}
+
+FileExists() {
+    [ -f "$1" ]
+}
 
 # EOF
