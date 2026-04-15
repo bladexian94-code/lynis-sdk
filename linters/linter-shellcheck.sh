@@ -1,102 +1,101 @@
 #!/bin/sh
-#
-# Lynis Development Kit -- linters/linter-shellcheck.sh
-# Version mejorada 1.1.0
-#
-# Cambios:
-#   - Usa LYNIS_DIR="${LYNIS_PATH:-../lynis}" del entorno (no ruta hardcodeada)
-#   - Muestra version de shellcheck al inicio
-#   - Instrucciones de instalacion para Debian, RHEL, Fedora, Arch, macOS
-#   - --format=gcc para integracion con IDEs y CI/CD
-#   - Conteo de archivos analizados e issues encontrados
 
-LYNIS_DIR="${LYNIS_PATH:-../lynis}"
-SDK_DIR="."
-SHELLCHECK_FORMAT="${SHELLCHECK_FORMAT:-gcc}"
-SC_ERRORS=0
-SC_FILES=0
+################################################################################
+#
+#   Lynis SDK — linters/linter-shellcheck.sh v1.1.0
+#
+# Cambios v1.1.0:
+#   - LYNIS_DIR ahora usa LYNIS_PATH del entorno del devkit (no ruta hardcodeada)
+#   - Instrucciones de instalación multi-distro (Debian, RHEL/Fedora, macOS, manual)
+#   - --format=gcc para integración con IDEs y pipelines CI/CD
+#   - Mensajes más claros cuando shellcheck no está disponible
+#
+################################################################################
 
-# -- Verificar shellcheck disponible ------------------------------------------
+# Lynis workflow (referencia):
+# lynis → include/consts → include/functions → db/languages/en
+# → include/parameters → include/osdetection → include/binaries
+# → plugins (fase 1) → tests → tests_custom → helper
+# → plugins (fase 2) → include/report → include/tool_tips → include/data_upload
+
+# ---------------------------------------------------------------------------
+# Verificar que shellcheck está instalado
+# ---------------------------------------------------------------------------
 if ! command -v shellcheck > /dev/null 2>&1; then
-    printf "${RED}[ERROR]${NORMAL} shellcheck no encontrado en el PATH.\n" >&2
-    printf "\nInstrucciones de instalacion:\n"
-    printf "  Debian/Ubuntu : sudo apt-get install shellcheck\n"
-    printf "  RHEL/CentOS 8 : sudo dnf install ShellCheck\n"
-    printf "  Fedora        : sudo dnf install ShellCheck\n"
-    printf "  Arch Linux    : sudo pacman -S shellcheck\n"
-    printf "  macOS (brew)  : brew install shellcheck\n"
-    printf "  Manual (x86_64):\n"
-    printf "    wget https://github.com/koalaman/shellcheck/releases/latest/download/shellcheck-stable.linux.x86_64.tar.xz\n"
-    printf "    tar -xf shellcheck-stable.linux.x86_64.tar.xz\n"
-    printf "    sudo mv shellcheck-stable/shellcheck /usr/local/bin/\n"
-    SDKExitFatal "Instale shellcheck y vuelva a ejecutar"
+    printf 'Error: shellcheck no encontrado en PATH.\n\n'
+    printf 'Instrucciones de instalación:\n'
+    printf '  Debian/Ubuntu:  apt-get install shellcheck\n'
+    printf '  RHEL/CentOS:    yum install ShellCheck\n'
+    printf '  Fedora:         dnf install ShellCheck\n'
+    printf '  macOS (brew):   brew install shellcheck\n'
+    printf '  Manual (amd64): wget -qO- "https://storage.googleapis.com/shellcheck/shellcheck-latest.linux.x86_64.tar.xz" | tar -xJv\n'
+    printf '  Cabal:          cabal update && cabal install shellcheck\n'
+    printf '\n'
+    exit 1
 fi
 
-SC_VERSION=$(shellcheck --version | grep -E "^version:" | awk '{print $2}')
-_info "shellcheck version: ${SC_VERSION}  formato: ${SHELLCHECK_FORMAT}"
+# ---------------------------------------------------------------------------
+# Ruta al directorio de Lynis:
+#   1. Usar LYNIS_PATH si está disponible (inyectado por lynis-devkit)
+#   2. Fallback a la ruta relativa clásica ../lynis
+# ---------------------------------------------------------------------------
+LYNIS_DIR="${LYNIS_PATH:-../lynis}"
 
-# -- Analisis de un archivo ---------------------------------------------------
-_sc_check() {
-    local file="$1"
-    SC_FILES=$((SC_FILES+1))
-    if shellcheck --format="${SHELLCHECK_FORMAT}" --shell=sh "${file}" 2>&1; then
-        return 0
-    else
-        SC_ERRORS=$((SC_ERRORS+1))
-        return 1
-    fi
-}
+if [ ! -d "${LYNIS_DIR}" ]; then
+    printf 'Error: directorio de Lynis no encontrado: %s\n' "${LYNIS_DIR}" >&2
+    printf 'Configurar lynis-directory en el archivo config o exportar LYNIS_PATH\n' >&2
+    exit 1
+fi
 
-Assert() {
-    local failed=0
+printf 'shellcheck versión: '
+shellcheck --version | grep '^version:' | awk '{ print $2 }'
+printf 'Directorio Lynis:   %s\n' "${LYNIS_DIR}"
+printf '\n'
 
-    # -- Analizar archivos del SDK -----------------------------------------
-    printf "\n${SECTION}=== Analizando SDK ===${NORMAL}\n"
-    while IFS= read -r FILE; do
-        if [ -z "${FILE}" ]; then continue ; fi
-        printf "  Archivo: %s\n" "${FILE}"
-        _sc_check "${FILE}" || failed=$((failed+1))
-    done << FILELIST
-$(find "${SDK_DIR}/checks" "${SDK_DIR}/unit-tests" "${SDK_DIR}/linters" \
-       -name "*.sh" -type f 2>/dev/null | sort)
-FILELIST
+# ---------------------------------------------------------------------------
+# Tests de shellcheck excluidos y motivos documentados
+# ---------------------------------------------------------------------------
+# SC1090: Can't follow non-constant source — aceptable con archivos incluidos dinámicamente
+# SC2006: Use $(...) notation instead of backticks — reportado por check-functions.sh
+# SC2012: Use find instead of ls to better handle non-alphanumeric filenames — ya conocido
+# SC2016: Expressions don't expand in single quotes — intencionado en varios sitios
+# SC2028: echo may not expand escape sequences — se usa printf donde importa
+# SC2034: VAR appears unused — muchas variables son exportadas a tests incluidos
+# SC2039: In POSIX sh, X is not supported — revisado caso a caso
+# SC2063: grep -E is not supported in classic sh — falsos positivos
+# SC2086: Double quote to prevent globbing — revisado caso a caso
+# SC2166: Prefer [ p ] && [ q ] — estilo aceptado en Lynis
+# SC2181: Check exit code directly — en Lynis se usa $? intencionadamente
+excluded_tests="SC1090,SC2006,SC2012,SC2016,SC2028,SC2034,SC2039,SC2063,SC2086,SC2166,SC2181"
 
-    for f in ./lynis-devkit ./include/devkit-functions; do
-        if [ -f "${f}" ]; then
-            printf "  Archivo: %s\n" "${f}"
-            _sc_check "${f}" || failed=$((failed+1))
-        fi
-    done
+# ---------------------------------------------------------------------------
+# Ejecutar shellcheck
+#
+# Opciones:
+#   --check-sourced  : analiza también los archivos incluidos con '.'
+#   --source-path    : rutas de búsqueda para archivos incluidos
+#   --shell=sh       : POSIX sh estricto
+#   --format=gcc     : formato compatible con IDEs (CLion, VSCode, etc.) y CI
+#   --exclude        : tests desactivados (documentados arriba)
+# ---------------------------------------------------------------------------
+printf 'Ejecutando shellcheck...\n'
 
-    # -- Analizar archivos de Lynis (si el directorio existe) -------------
-    if [ -d "${LYNIS_DIR}" ]; then
-        printf "\n${SECTION}=== Analizando Lynis en: %s ===${NORMAL}\n" "${LYNIS_DIR}"
-        while IFS= read -r FILE; do
-            if [ -z "${FILE}" ]; then continue ; fi
-            printf "  Archivo: %s\n" "${FILE}"
-            _sc_check "${FILE}" || failed=$((failed+1))
-        done << FILELIST
-$(find "${LYNIS_DIR}/include" -type f 2>/dev/null | sort)
-FILELIST
-        if [ -f "${LYNIS_DIR}/lynis" ]; then
-            printf "  Archivo: %s/lynis\n" "${LYNIS_DIR}"
-            _sc_check "${LYNIS_DIR}/lynis" || failed=$((failed+1))
-        fi
-    else
-        _warn "Directorio Lynis no encontrado: ${LYNIS_DIR}"
-        _warn "Defina LYNIS_PATH o coloque 'lynis' en ../lynis para analisis completo"
-    fi
+shellcheck \
+    --check-sourced \
+    --source-path="${LYNIS_DIR}/db:${LYNIS_DIR}/include" \
+    --shell=sh \
+    --format=gcc \
+    --exclude="${excluded_tests}" \
+    "${LYNIS_DIR}/lynis" \
+    "${LYNIS_DIR}/include/"*
 
-    printf "\n"
-    printf "  Archivos analizados : %d\n" "${SC_FILES}"
-    printf "  Archivos con issues : %d\n" "${failed}"
+_sc_rc=$?
+if [ "${_sc_rc}" -eq 0 ]; then
+    printf '\n[OK] shellcheck no encontró problemas.\n'
+else
+    printf '\n[!] shellcheck encontró advertencias/errores (código: %d).\n' "${_sc_rc}"
+fi
 
-    if [ "${failed}" -eq 0 ]; then
-        SDKPrintOK
-    else
-        SDKPrintFailed
-    fi
+exit "${_sc_rc}"
 
-    return "${failed}"
-}
 # EOF

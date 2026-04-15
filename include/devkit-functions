@@ -1,111 +1,173 @@
 #!/bin/sh
-#
-# Lynis Development Kit -- include/devkit-functions
-# Version mejorada 1.1.0
-#
-# Cambios respecto al original:
-#   - SDKCheckTool: funcion reutilizable para verificar dependencias
-#   - SDKBuildPackageDEB: verifica exit code de dpkg-buildpackage
-#   - SDKBuildPackageRPM: verifica existencia de ../lynis y del spec;
-#     elimina 'ls' sobre ./tmp/lynis-build/ (path inexistente)
-#   - Todas las funciones usan _fatal/_warn para output consistente
 
-# -- Verificacion de dependencias (reutilizable) ------------------------------
-SDKCheckTool() {
-    local tool="$1"
-    local install_hint="${2:-}"
-    if ! command -v "${tool}" > /dev/null 2>&1; then
-        if [ -n "${install_hint}" ]; then
-            _fatal "Herramienta requerida '${tool}' no encontrada. Para instalar: ${install_hint}"
-        else
-            _fatal "Herramienta requerida '${tool}' no encontrada en el PATH"
+################################################################################
+#
+#   Lynis SDK — devkit-functions v1.1.0
+#
+# Cambios:
+#   - SDKCheckTool():  función reutilizable para verificar dependencias
+#   - SDKBuildPackageDEB(): verifica exit code de dpkg-buildpackage
+#   - SDKBuildPackageRPM(): corrige ruta ~/lynis-build (no ./tmp/),
+#     verifica exit code de rpmbuild
+#   - SDKPrintOK/SDKPrintFailed: con colores si TTY disponible
+#   - SDKLogText(): wrapper de logging compatible con Lynis LogText
+#
+################################################################################
+
+    ############################################################################
+    # SDKCheckTool TOOL [INSTALL_HINT]
+    # Verifica que TOOL está en PATH. Si no, llama SDKExitFatal con mensaje
+    # opcional de instalación.
+    ############################################################################
+    SDKCheckTool() {
+        _sdk_tool="$1"
+        _sdk_hint="${2:-}"
+        if ! command -v "${_sdk_tool}" > /dev/null 2>&1; then
+            if [ -n "${_sdk_hint}" ]; then
+                SDKExitFatal "'${_sdk_tool}' no encontrado. Para instalar: ${_sdk_hint}"
+            else
+                SDKExitFatal "'${_sdk_tool}' no encontrado en PATH"
+            fi
         fi
-    fi
-}
+        SDKLogText "SDKCheckTool: '${_sdk_tool}' encontrado"
+    }
 
-# -- Output de resultados -----------------------------------------------------
-SDKPrintOK() {
-    printf " ${GREEN}[ OK ]${NORMAL}\n"
-}
+    ############################################################################
+    # SDKBuildPackageDEB()
+    # Construye un paquete .deb verificando dependencias y exit codes.
+    ############################################################################
+    SDKBuildPackageDEB() {
+        SDKLogText "SDKBuildPackageDEB: iniciando construcción de paquete DEB"
 
-SDKPrintFailed() {
-    printf " ${RED}[FAILED]${NORMAL}\n"
-}
+        if [ -x /usr/bin/dpkg ]; then
+            dpkg -l dpkg-dev 2>/dev/null | grep "^ii" | grep -q "dpkg-dev" \
+                || SDKExitFatal "Paquete 'dpkg-dev' no instalado. Instalar con: apt-get install dpkg-dev"
+            dpkg -l debhelper 2>/dev/null | grep "^ii" | grep -q "debhelper" \
+                || SDKExitFatal "Paquete 'debhelper' no instalado. Instalar con: apt-get install debhelper"
+        else
+            SDKLogText "SDKBuildPackageDEB: dpkg no disponible, omitiendo verificación de dependencias"
+            printf '[WARN]  dpkg no disponible: no se verificaron dependencias DEB\n'
+        fi
 
-SDKShowLine() {
-    printf "...\n"
-}
+        printf 'Building DEB package...\n'
+        SDKShowLine
 
-SDKShowSection() {
-    printf "\n${SECTION}%s${NORMAL}\n" "$*"
-}
+        if dpkg-buildpackage -b -us -uc; then
+            SDKLogText "SDKBuildPackageDEB: construcción DEB completada correctamente"
+            SDKShowLine
+            SDKPrintOK
+        else
+            _deb_rc=$?
+            SDKLogText "SDKBuildPackageDEB: dpkg-buildpackage falló con código ${_deb_rc}"
+            SDKShowLine
+            SDKPrintFailed
+            SDKExitFatal "dpkg-buildpackage falló (código de salida: ${_deb_rc})"
+        fi
+    }
 
-SDKExitFatal() {
-    printf "${RED}[FATAL]${NORMAL} %s\n" "$*" >&2
-    exit 1
-}
+    ############################################################################
+    # SDKBuildPackageRPM()
+    # Construye un paquete .rpm verificando dependencias y exit codes.
+    # CORRECCIÓN: usa ~/lynis-build (no ./tmp/lynis-build que no existe).
+    ############################################################################
+    SDKBuildPackageRPM() {
+        SDKLogText "SDKBuildPackageRPM: iniciando construcción de paquete RPM"
 
-# -- Build: paquete DEB -------------------------------------------------------
-SDKBuildPackageDEB() {
-    SDKCheckTool "dpkg-buildpackage" "apt-get install dpkg-dev"
-    SDKCheckTool "dh_make"           "apt-get install dh-make"
+        SDKCheckTool "rpmbuild" "yum install rpm-build  # RHEL/CentOS\n  dnf install rpm-build  # Fedora"
 
-    if [ ! -d "../lynis" ]; then
-        _fatal "Directorio '../lynis' no encontrado. Clone el repositorio lynis junto a lynis-sdk."
-    fi
+        if [ -x /usr/bin/dpkg ]; then
+            dpkg -l rpm 2>/dev/null | grep "^ii" | grep -q "rpm" \
+                || SDKExitFatal "Paquete 'rpm' no instalado. Instalar con: apt-get install rpm"
+        fi
 
-    SDKShowSection "Construyendo paquete DEB"
+        # Verificar que el directorio fuente de Lynis existe antes de empaquetar
+        if [ ! -d "${LYNIS_PATH}" ]; then
+            SDKExitFatal "Directorio de Lynis no encontrado: ${LYNIS_PATH}"
+        fi
 
-    _DPKG_TMP=$(_mktmp)
-    if dpkg-buildpackage -us -uc -b > "${_DPKG_TMP}" 2>&1; then
-        _ok "Paquete DEB construido correctamente"
-        if [ "${VERBOSE}" -eq 1 ]; then cat "${_DPKG_TMP}" ; fi
-    else
-        _error "dpkg-buildpackage fallo con codigo $?"
-        cat "${_DPKG_TMP}" >&2
-        return 1
-    fi
-}
+        # Crear estructura rpmbuild en HOME (ruta correcta, no ./tmp/)
+        _rpm_base="${HOME}/lynis-build/rpmbuild"
+        for _dir in BUILD BUILDROOT RPMS SOURCES SRPMS; do
+            if [ ! -d "${_rpm_base}/${_dir}" ]; then
+                mkdir -p "${_rpm_base}/${_dir}" \
+                    || SDKExitFatal "No se pudo crear: ${_rpm_base}/${_dir}"
+                SDKLogText "SDKBuildPackageRPM: creado directorio ${_rpm_base}/${_dir}"
+            fi
+        done
 
-# -- Build: paquete RPM -------------------------------------------------------
-SDKBuildPackageRPM() {
-    SDKCheckTool "rpmbuild" "yum install rpm-build   # RHEL/CentOS
-dnf install rpm-build    # Fedora"
+        printf 'Building RPM package...\n'
+        SDKShowLine
 
-    if [ ! -d "../lynis" ]; then
-        _fatal "Directorio '../lynis' no encontrado. Clone el repositorio lynis junto a lynis-sdk."
-    fi
+        # Crear tarball fuente
+        _tarball="${_rpm_base}/SOURCES/lynis-${LYNIS_VERSION}.tar.gz"
+        SDKLogText "SDKBuildPackageRPM: creando tarball ${_tarball}"
+        tar --create -z -f "${_tarball}" -C "$(dirname "${LYNIS_PATH}")" "$(basename "${LYNIS_PATH}")" \
+            || SDKExitFatal "No se pudo crear el tarball: ${_tarball}"
 
-    SPECFILE=$(find ./extras -name "*.spec" -type f 2>/dev/null | head -1)
-    if [ -z "${SPECFILE}" ]; then
-        SPECFILE=$(find . -maxdepth 2 -name "*.spec" -type f 2>/dev/null | head -1)
-    fi
-    if [ -z "${SPECFILE}" ]; then
-        _fatal "No se encontro ningun archivo .spec para el build RPM"
-    fi
-    _info "Usando spec file: ${SPECFILE}"
+        SDKShowLine
+        ls -lh "${_tarball}" || true
+        SDKShowLine
 
-    SDKShowSection "Construyendo paquete RPM"
+        # Construir RPM y verificar exit code
+        if rpmbuild -ba ./package-building/lynis.spec \
+               --define "_topdir ${_rpm_base}"; then
+            SDKLogText "SDKBuildPackageRPM: construcción RPM completada correctamente"
+            SDKShowLine
+            SDKPrintOK
+        else
+            _rpm_rc=$?
+            SDKLogText "SDKBuildPackageRPM: rpmbuild falló con código ${_rpm_rc}"
+            SDKShowLine
+            SDKPrintFailed
+            SDKExitFatal "rpmbuild falló (código de salida: ${_rpm_rc})"
+        fi
+    }
 
-    _RPM_TMP=$(_mktmp)
-    if rpmbuild -ba "${SPECFILE}" > "${_RPM_TMP}" 2>&1; then
-        _ok "Paquete RPM construido correctamente"
-        if [ "${VERBOSE}" -eq 1 ]; then cat "${_RPM_TMP}" ; fi
-    else
-        _error "rpmbuild fallo con codigo $?"
-        cat "${_RPM_TMP}" >&2
-        return 1
-    fi
-}
+    ############################################################################
+    # SDKExitFatal MSG
+    # Termina el programa con error fatal.
+    ############################################################################
+    SDKExitFatal() {
+        printf '%s[FATAL]%s %s\n' "${RED:-}" "${NORMAL:-}" "$1" >&2
+        exit 1
+    }
 
-# -- Funciones de test --------------------------------------------------------
-# Compatibilidad: se definen aqui por si Lynis no las provee al sourcear
-DirectoryExists() {
-    [ -d "$1" ]
-}
+    ############################################################################
+    # SDKLogText MSG
+    # Wrapper de logging: usa LogText() de Lynis si está disponible,
+    # de lo contrario escribe directamente al LOGFILE del devkit.
+    ############################################################################
+    SDKLogText() {
+        if command -v LogText > /dev/null 2>&1; then
+            LogText "[SDK] $1"
+        else
+            printf '[%s] [SDK  ] %s\n' \
+                "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "${LOGFILE:-/dev/null}"
+        fi
+    }
 
-FileExists() {
-    [ -f "$1" ]
-}
+    ############################################################################
+    # SDKShowLine()
+    # Imprime una línea separadora.
+    ############################################################################
+    SDKShowLine() {
+        printf '===============================================================\n'
+    }
+
+    ############################################################################
+    # SDKPrintOK()
+    # Imprime resultado OK con color verde si TTY disponible.
+    ############################################################################
+    SDKPrintOK() {
+        printf ' %s[ OK ]%s\n' "${GREEN:-}" "${NORMAL:-}"
+    }
+
+    ############################################################################
+    # SDKPrintFailed()
+    # Imprime resultado FAILED con color rojo si TTY disponible.
+    ############################################################################
+    SDKPrintFailed() {
+        printf ' %s[FAILED]%s\n' "${RED:-}" "${NORMAL:-}"
+    }
 
 # EOF
