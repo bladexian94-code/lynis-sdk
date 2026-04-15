@@ -1,427 +1,488 @@
 #!/bin/sh
-#
-# Lynis Development Kit  --  version mejorada 1.1.0
-# Repositorio original: https://github.com/CISOfy/lynis-sdk
-#
-# Cambios respecto a v1.0.6:
-#   - Colores portables via tput con fallback seguro
-#   - Logging funcional con timestamps escritos en LOGFILE
-#   - Parseo de config robusto (comentarios, espacios, valores con '=')
-#   - Flags CLI: --help, --version, --verbose, --dry-run, --config
-#   - _parse_args integrado (ya no se sourcea include/parameters)
-#   - trap para cleanup garantizado de archivos temporales
-#   - Validacion de version minima de Lynis (POSIX sort)
-#   - Codigos de salida CI-friendly en todos los modos
-#   - grep -E en lugar de egrep (deprecated en POSIX moderno)
-#   - Eliminados backticks; todo usa $()
 
-set -o nounset
+################################################################################
+#
+#   Lynis SDK — devkit v1.1.0
+# ------------------
+#
+# Copyright (c) Michael Boelen, CISOfy, and many contributors.
+# Improvements: bladexian94-code (2026)
+#
+# Website  : https://cisofy.com/
+# GitHub   : https://github.com/CISOfy/lynis
+#
+################################################################################
+#
+# Changes v1.1.0:
+#   - Colores portables via tput (no más variables vacías)
+#   - Logging real con timestamps a LOGFILE
+#   - Parseo de config robusto (maneja comentarios '#', espacios alrededor '=')
+#   - Flags CLI completos: --help, --version, --verbose, --dry-run, --config FILE
+#   - trap EXIT/INT/TERM para limpieza de temporales
+#   - Validación de versión mínima de Lynis (POSIX puro)
+#   - grep -E en lugar de egrep (deprecated)
+#   - set -u ya no aborta con variables opcionales vacías
+#
+################################################################################
 
-# -- Constantes ---------------------------------------------------------------
-DEVKIT_RELEASE="20260414"
+# --- Modo estricto POSIX (sin -o nounset global para variables opcionales) ---
+set -e
+
+# --- Constantes del devkit ---
+DEVKIT_RELEASE="20260415"
 DEVKIT_VERSION="1.1.0"
 DEVKIT_MIN_LYNIS_VERSION="3.0.0"
 
+# --- Valores por defecto (sobrescribibles por flags CLI) ---
 CONFIG_FILE="config"
 MODE="do-nothing"
-MY_USER_ID=$(id -u)
 VERBOSE=0
 DRY_RUN=0
 LOGFILE="./lynis-dev.log"
-ERRORS=0
-WARNINGS=0
-LYNIS_PATH=""
-LYNIS_VERSION=""
 
-# -- Colores portables con tput -----------------------------------------------
+# --- Variables de contexto Lynis (requeridas por include/functions) ---
+SHOW_WARNINGS_ONLY=0
+LOGTEXT=1
+QUIET=0
+CRONJOB=0
+ECHOCMD="echo"
+DISPLAY_LANG="${LANG:-C}"
+
+# --- Variables de color (se inicializan en _setup_colors) ---
+NORMAL=""; BOLD=""; RED=""; GREEN=""; YELLOW=""; CYAN=""; WHITE=""
+SECTION=""
+
+# --- Registro de temporales para trap ---
+_TMPFILES=""
+
+################################################################################
+# _setup_colors(): inicializa colores de terminal via tput de forma portable.
+# Si la salida no es un TTY o tput no está disponible, deja las variables vacías
+# para que el output sea limpio en logs y pipelines.
+################################################################################
 _setup_colors() {
     if [ -t 1 ] && command -v tput > /dev/null 2>&1; then
-        NORMAL=$(tput sgr0)
-        BOLD=$(tput bold)
-        RED=$(tput setaf 1)
-        GREEN=$(tput setaf 2)
-        YELLOW=$(tput setaf 3)
-        CYAN=$(tput setaf 6)
-    else
-        NORMAL="" ; BOLD="" ; RED="" ; GREEN="" ; YELLOW="" ; CYAN=""
+        NORMAL=$(tput sgr0   2>/dev/null || printf '')
+        BOLD=$(tput bold     2>/dev/null || printf '')
+        RED=$(tput setaf 1   2>/dev/null || printf '')
+        GREEN=$(tput setaf 2 2>/dev/null || printf '')
+        YELLOW=$(tput setaf 3 2>/dev/null || printf '')
+        CYAN=$(tput setaf 6  2>/dev/null || printf '')
+        WHITE=$(tput setaf 7 2>/dev/null || printf '')
     fi
-    SECTION="${CYAN}${BOLD}"
+    SECTION="${YELLOW}"
 }
-_setup_colors
 
-# -- Logging y output ---------------------------------------------------------
+################################################################################
+# Funciones de logging:
+#   _log LEVEL msg  — escribe a LOGFILE con timestamp ISO-8601
+#   _info  msg      — INFO  (stdout + log)
+#   _warn  msg      — WARN  (stdout + log)
+#   _err   msg      — ERROR (stderr + log)
+#   _fatal msg      — FATAL (stderr + log + exit 1)
+#   _debug msg      — DEBUG (stdout + log, solo si VERBOSE=1)
+################################################################################
 _log() {
-    local level="$1"
-    shift
-    printf "[%s] [%s] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "${level}" "$*" >> "${LOGFILE}"
-}
-_info()  { printf "${CYAN}[INFO]${NORMAL}  %s\n" "$*" ;  _log "INFO"  "$*" ; }
-_ok()    { printf "${GREEN}[ OK ]${NORMAL}  %s\n" "$*" ; _log "OK"    "$*" ; }
-_warn()  { WARNINGS=$((WARNINGS+1)) ; printf "${YELLOW}[WARN]${NORMAL}  %s\n" "$*" >&2 ; _log "WARN" "$*" ; }
-_error() { ERRORS=$((ERRORS+1))    ; printf "${RED}[ERR] ${NORMAL}  %s\n" "$*" >&2 ; _log "ERROR" "$*" ; }
-_fatal() { printf "${RED}[FATAL]${NORMAL} %s\n" "$*" >&2 ; _log "FATAL" "$*" ; exit 1 ; }
-_sep()   { printf "========================================================================\n" ; }
-
-# -- Ayuda --------------------------------------------------------------------
-_show_help() {
-    cat << HELPEOF
-${BOLD}Lynis Development Kit${NORMAL} ${DEVKIT_VERSION}
-
-${BOLD}USO${NORMAL}
-  $0 [OPCIONES] COMANDO [SUBCOMANDO]
-
-${BOLD}COMANDOS DE CONSTRUCCION${NORMAL}
-  build all             Construir paquetes DEB y RPM
-  build deb             Construir paquete DEB (Debian/Ubuntu)
-  build rpm             Construir paquete RPM (RHEL/CentOS/Fedora)
-
-${BOLD}COMANDOS DE CALIDAD${NORMAL}
-  run checks            Comprobaciones de estilo y convenciones
-  run linters           Analisis estatico con shellcheck
-  run spelling-check    Verificacion ortografica (requiere aspell)
-  run unit-tests        Ejecutar tests unitarios
-
-${BOLD}COMANDOS DE IDIOMA${NORMAL}
-  update language-files Actualizar archivos de traduccion
-
-${BOLD}OPCIONES${NORMAL}
-  --help,    -h         Mostrar esta ayuda y salir
-  --version             Mostrar version del devkit y salir
-  --verbose, -v         Salida detallada
-  --dry-run             Simular sin ejecutar acciones reales
-  --config   ARCHIVO    Usar archivo de configuracion alternativo
-
-${BOLD}EJEMPLOS${NORMAL}
-  $0 run unit-tests
-  $0 --verbose run linters
-  $0 --dry-run build deb
-  $0 --config /etc/lynis-sdk/config run checks
-
-HELPEOF
+    _lvl="$1"; shift
+    printf '[%s] [%s] %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "${_lvl}" "$*" >> "${LOGFILE}"
 }
 
-_show_version() {
-    printf "lynis-devkit %s (release %s)\n" "${DEVKIT_VERSION}" "${DEVKIT_RELEASE}"
-}
-
-# -- Parseo de config robusto -------------------------------------------------
-# Maneja: comentarios (#), espacios alrededor de '=', lineas vacias
-_config_get() {
-    local key="$1"
-    local default="${2:-}"
-    local val
-    val=$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "${CONFIG_FILE}" \
-          | grep -v "^[[:space:]]*#" \
-          | head -1 \
-          | sed 's/^[^=]*=[[:space:]]*//' \
-          | sed 's/[[:space:]]*$//')
-    if [ -z "${val}" ]; then
-        printf "%s" "${default}"
-    else
-        printf "%s" "${val}"
+_info()  { printf '%s[INFO]%s  %s\n' "${CYAN}"  "${NORMAL}" "$*";         _log "INFO " "$*"; }
+_warn()  { printf '%s[WARN]%s  %s\n' "${YELLOW}""${NORMAL}" "$*";         _log "WARN " "$*"; }
+_err()   { printf '%s[ERROR]%s %s\n' "${RED}"   "${NORMAL}" "$*" >&2;     _log "ERROR" "$*"; }
+_fatal() { printf '%s[FATAL]%s %s\n' "${RED}"   "${NORMAL}" "$*" >&2;     _log "FATAL" "$*"; exit 1; }
+_debug() {
+    if [ "${VERBOSE}" -eq 1 ]; then
+        printf '%s[DEBUG]%s %s\n' "${BOLD}" "${NORMAL}" "$*"
+        _log "DEBUG" "$*"
     fi
 }
 
-# -- Comparacion semantica de versiones (POSIX, sin bashismos) ----------------
-# Retorna 0 si ver1 >= ver2
-_version_gte() {
-    local ver1="$1"
-    local ver2="$2"
-    printf "%s\n%s\n" "${ver1}" "${ver2}" \
-        | sort -t. -k1,1n -k2,2n -k3,3n \
-        | head -1 \
-        | grep -qF "${ver2}"
-}
-
-# -- Cleanup de archivos temporales -------------------------------------------
-_TMPFILES=""
+################################################################################
+# _cleanup(): elimina archivos temporales registrados en _TMPFILES.
+# Invocada automáticamente por trap en EXIT/INT/TERM.
+################################################################################
 _cleanup() {
-    local code=$?
-    for f in ${_TMPFILES}; do
-        if [ -f "${f}" ]; then rm -f "${f}" ; fi
+    for _f in ${_TMPFILES}; do
+        [ -f "${_f}" ] && rm -f "${_f}"
     done
-    if [ "${code}" -ne 0 ] && [ "${MODE}" != "do-nothing" ]; then
-        _log "EXIT" "Codigo de salida: ${code}"
-    fi
 }
 trap _cleanup EXIT INT TERM
 
+################################################################################
+# _mktmp(): crea un archivo temporal y lo registra para limpieza automática.
+# Retorna la ruta en stdout.
+################################################################################
 _mktmp() {
-    local tmp
-    tmp=$(mktemp /tmp/lynis-devkit-XXXXXXXXXX)
-    _TMPFILES="${_TMPFILES} ${tmp}"
-    printf "%s" "${tmp}"
+    _t=$(mktemp /tmp/lynis-sdk.XXXXXXXXXX) || _fatal "No se pudo crear archivo temporal"
+    _TMPFILES="${_TMPFILES} ${_t}"
+    printf '%s' "${_t}"
 }
 
-# -- Parseado de argumentos CLI -----------------------------------------------
-_parse_args() {
-    if [ $# -eq 0 ]; then
-        MODE="do-nothing"
-        return 0
-    fi
-    while [ $# -ge 1 ]; do
-        case "$1" in
-            --help|-h)
-                _show_help ; exit 0 ;;
-            --version)
-                _show_version ; exit 0 ;;
-            --verbose|-v)
-                VERBOSE=1 ; shift ;;
-            --dry-run)
-                DRY_RUN=1 ; shift ;;
-            --config)
-                if [ $# -ge 2 ]; then
-                    CONFIG_FILE="$2" ; shift 2
-                else
-                    echo "Error: --config requiere un argumento" >&2 ; exit 1
-                fi
-                ;;
-            build)
-                if [ $# -ge 2 ]; then
-                    case "$2" in
-                        all)      MODE="build-all" ;;
-                        deb|dpkg) MODE="build-deb" ;;
-                        rpm)      MODE="build-rpm" ;;
-                        *)
-                            echo "Error: objetivo de build desconocido: '$2'" >&2
-                            echo "Validos: all, deb, rpm" >&2 ; exit 1 ;;
-                    esac
-                    shift 2
-                else
-                    echo "Error: 'build' requiere un objetivo" >&2
-                    echo "Ejemplos: $0 build deb | $0 build rpm | $0 build all" >&2
-                    exit 1
-                fi
-                ;;
-            run)
-                if [ $# -ge 2 ]; then
-                    case "$2" in
-                        checks)         MODE="run-checks"         ;;
-                        linters)        MODE="run-linters"        ;;
-                        spelling-check) MODE="run-spelling-check" ;;
-                        unit-tests)     MODE="run-unit-tests"     ;;
-                        *)
-                            echo "Error: subcomando 'run' desconocido: '$2'" >&2 ; exit 1 ;;
-                    esac
-                    shift 2
-                else
-                    echo "Error: 'run' requiere un subcomando" >&2
-                    echo "Ejemplos: $0 run checks | $0 run linters | $0 run unit-tests" >&2
-                    exit 1
-                fi
-                ;;
-            update)
-                if [ $# -ge 2 ]; then
-                    case "$2" in
-                        language-files) MODE="update-language-files" ;;
-                        *)
-                            echo "Error: subcomando 'update' desconocido: '$2'" >&2 ; exit 1 ;;
-                    esac
-                    shift 2
-                else
-                    echo "Error: 'update' requiere un subcomando" >&2
-                    echo "Ejemplo: $0 update language-files" >&2
-                    exit 1
-                fi
-                ;;
-            *)
-                echo "Error: argumento desconocido: '$1'" >&2
-                echo "Use --help para ver la ayuda." >&2
-                exit 1 ;;
-        esac
-    done
-}
+################################################################################
+# _config_get KEY [DEFAULT]
+# Extrae el valor de KEY del CONFIG_FILE de forma robusta:
+#   - Ignora líneas comentadas con '#'
+#   - Acepta espacios alrededor del '='
+#   - Toma solo la primera coincidencia
+#   - Si no encuentra nada y se proporcionó DEFAULT, lo devuelve
+################################################################################
+_config_get() {
+    _key="$1"
+    _default="${2:-}"
+    _val=""
 
-# -- Comprobaciones previas al inicio -----------------------------------------
-_preflight_checks() {
-    if [ "${MY_USER_ID}" = "0" ]; then
-        _fatal "No ejecutar como root. Use un usuario sin privilegios."
-    fi
-    if [ ! -f "${CONFIG_FILE}" ]; then
-        _fatal "Archivo de configuracion no encontrado: '${CONFIG_FILE}'"
+    if [ -f "${CONFIG_FILE}" ]; then
+        # 1. Filtrar comentarios  2. Buscar la clave  3. Extraer valor
+        _val=$(grep -E "^[[:space:]]*${_key}[[:space:]]*=" "${CONFIG_FILE}" \
+               | grep -v "^[[:space:]]*#" \
+               | head -1 \
+               | sed 's/^[^=]*=[[:space:]]*//' \
+               | sed 's/[[:space:]]*$//')
     fi
 
-    LYNIS_PATH=$(_config_get "lynis-directory")
-    if [ -z "${LYNIS_PATH}" ] || [ ! -d "${LYNIS_PATH}" ]; then
-        _fatal "Directorio Lynis no encontrado. Verifique 'lynis-directory' en ${CONFIG_FILE}"
-    fi
-    if [ ! -f "${LYNIS_PATH}/lynis" ]; then
-        _fatal "Script Lynis no encontrado en: ${LYNIS_PATH}/lynis"
-    fi
-
-    LYNIS_VERSION=$(grep -m1 "^PROGRAM_VERSION=" "${LYNIS_PATH}/lynis" \
-                    | sed 's/PROGRAM_VERSION=//;s/"//g;s/[[:space:]]//g')
-    if [ -z "${LYNIS_VERSION}" ]; then
-        _warn "No se pudo detectar la version de Lynis"
-        LYNIS_VERSION="unknown"
+    if [ -z "${_val}" ]; then
+        printf '%s' "${_default}"
     else
-        if ! _version_gte "${LYNIS_VERSION}" "${DEVKIT_MIN_LYNIS_VERSION}" 2>/dev/null; then
-            _warn "Lynis ${LYNIS_VERSION} es anterior a la version minima recomendada (${DEVKIT_MIN_LYNIS_VERSION})"
-        fi
-    fi
-
-    if [ "${VERBOSE}" -eq 0 ]; then
-        local cfg_v
-        cfg_v=$(_config_get "verbose" "no")
-        case "${cfg_v}" in
-            yes|YES|true|TRUE|1) VERBOSE=1 ;;
-        esac
+        printf '%s' "${_val}"
     fi
 }
 
-# -- Cargar includes ----------------------------------------------------------
-_load_includes() {
-    local f="${LYNIS_PATH}/include/functions"
-    if [ -f "${f}" ]; then
-        if [ "${VERBOSE}" -eq 1 ]; then _info "Cargando funciones Lynis: ${f}" ; fi
-        # shellcheck source=/dev/null
-        . "${f}"
-    else
-        _warn "Funciones de Lynis no encontradas: ${f}"
-    fi
+################################################################################
+# _version_gte V1 V2
+# Devuelve 0 (true) si V1 >= V2, semver simple (major.minor.patch).
+# POSIX puro: sin arrays, sin bashismos. Funciona con sort -t.
+################################################################################
+_version_gte() {
+    # Reemplazar puntos por espacios para comparar campo a campo
+    _v1_major=$(printf '%s' "$1" | cut -d. -f1)
+    _v1_minor=$(printf '%s' "$1" | cut -d. -f2)
+    _v1_patch=$(printf '%s' "$1" | cut -d. -f3)
+    _v2_major=$(printf '%s' "$2" | cut -d. -f1)
+    _v2_minor=$(printf '%s' "$2" | cut -d. -f2)
+    _v2_patch=$(printf '%s' "$2" | cut -d. -f3)
 
-    f="./include/devkit-functions"
-    if [ -f "${f}" ]; then
-        if [ "${VERBOSE}" -eq 1 ]; then _info "Cargando funciones devkit" ; fi
-        # shellcheck source=/dev/null
-        . "${f}"
-    else
-        _fatal "Funciones del devkit no encontradas: ${f}"
-    fi
-}
+    # Asegurar valores numéricos (default 0 si vacío)
+    _v1_major=${_v1_major:-0}; _v1_minor=${_v1_minor:-0}; _v1_patch=${_v1_patch:-0}
+    _v2_major=${_v2_major:-0}; _v2_minor=${_v2_minor:-0}; _v2_patch=${_v2_patch:-0}
 
-# -- Suite runner generico ----------------------------------------------------
-# Sourcea cada archivo del directorio, llama Assert() y acumula resultados
-_run_suite() {
-    local suite_dir="$1"
-    local pattern="$2"
-    local label="$3"
-    local failed=0
-    local passed=0
-    local total=0
-
-    if [ ! -d "${suite_dir}" ]; then
-        _warn "Directorio '${suite_dir}' no encontrado, omitiendo"
-        return 0
-    fi
-
-    while IFS= read -r FILE; do
-        if [ -z "${FILE}" ]; then continue ; fi
-        total=$((total+1))
-        if [ "${VERBOSE}" -eq 1 ]; then _info "${label}: ${FILE}" ; fi
-        if [ "${DRY_RUN}" -eq 1 ]; then
-            _info "[dry-run] Ejecutaria: ${FILE}" ; continue
-        fi
-        printf "------------------------------------------------------------------------\n"
-        # shellcheck source=/dev/null
-        . "${FILE}"
-        if Assert; then
-            passed=$((passed+1))
-        else
-            failed=$((failed+1))
-            _error "Fallo en: ${FILE}"
-        fi
-    done << FILELIST
-$(find "${suite_dir}" -name "${pattern}" -type f | sort)
-FILELIST
-
-    if [ "${DRY_RUN}" -eq 0 ]; then
-        _info "${label}: ${passed}/${total} OK, ${failed} fallidos"
-    fi
-    return "${failed}"
-}
-
-# -- Ejecutores de modos ------------------------------------------------------
-_run_checks()     { _run_suite "./checks"     "check-*"  "Check"     ; }
-_run_unit_tests() { _run_suite "./unit-tests" "tests-*"  "Unit-test" ; }
-
-_run_linters() {
-    _info "Ejecutando linters..."
-    if [ ! -d "./linters" ]; then
-        _warn "Directorio './linters' no encontrado" ; return 0
-    fi
-    while IFS= read -r FILE; do
-        if [ -z "${FILE}" ]; then continue ; fi
-        if [ "${VERBOSE}" -eq 1 ]; then _info "Linter: ${FILE}" ; fi
-        if [ "${DRY_RUN}" -eq 1 ]; then
-            _info "[dry-run] Linter: ${FILE}" ; continue
-        fi
-        printf "\n${SECTION}=== Linter: %s ===${NORMAL}\n" "${FILE}"
-        # shellcheck source=/dev/null
-        . "${FILE}"
-    done << FILELIST
-$(find ./linters -type f -name "linter-*" | sort)
-FILELIST
-}
-
-_run_spelling_check() {
-    _info "Ejecutando comprobacion ortografica..."
-    if [ "${DRY_RUN}" -eq 1 ]; then
-        _info "[dry-run] grammar-check-spelling" ; return 0
-    fi
-    if [ -f "./grammar/grammar-check-spelling" ]; then
-        # shellcheck source=/dev/null
-        . ./grammar/grammar-check-spelling
-    else
-        _warn "Archivo ./grammar/grammar-check-spelling no encontrado"
+    if   [ "${_v1_major}" -gt "${_v2_major}" ]; then return 0
+    elif [ "${_v1_major}" -lt "${_v2_major}" ]; then return 1
+    elif [ "${_v1_minor}" -gt "${_v2_minor}" ]; then return 0
+    elif [ "${_v1_minor}" -lt "${_v2_minor}" ]; then return 1
+    elif [ "${_v1_patch}" -ge "${_v2_patch}" ]; then return 0
+    else return 1
     fi
 }
 
-_update_language_files() {
-    _info "Actualizando archivos de idioma..."
-    if [ ! -d "./languages" ]; then
-        _warn "Directorio './languages' no encontrado" ; return 0
-    fi
-    while IFS= read -r FILE; do
-        if [ -z "${FILE}" ]; then continue ; fi
-        if [ "${DRY_RUN}" -eq 1 ]; then
-            _info "[dry-run] Actualizaria: ${FILE}" ; continue
-        fi
-        # shellcheck source=/dev/null
-        . "${FILE}"
-        UpdateLanguageFiles
-    done << FILELIST
-$(find ./languages -name "languages-*" -type f | sort)
-FILELIST
+################################################################################
+# _show_help(): muestra la ayuda completa.
+################################################################################
+_show_help() {
+    cat <<EOF
+${BOLD}Lynis SDK devkit v${DEVKIT_VERSION}${NORMAL}
+
+${BOLD}USO:${NORMAL}
+  $0 [OPCIONES] ACCION [SUBTAREA]
+
+${BOLD}OPCIONES:${NORMAL}
+  --help              Mostrar esta ayuda y salir
+  --version           Mostrar versión del devkit y salir
+  --verbose, -v       Modo detallado (activa mensajes DEBUG)
+  --dry-run           Simular ejecución sin hacer cambios reales
+  --config FILE       Usar FILE como archivo de configuración (por defecto: config)
+
+${BOLD}ACCIONES:${NORMAL}
+  build deb           Construir paquete .deb
+  build rpm           Construir paquete .rpm
+  build all           Construir todos los paquetes
+  run checks          Ejecutar comprobaciones de calidad
+  run linters         Ejecutar linters (shellcheck)
+  run spelling-check  Comprobar ortografía en archivos de idioma
+  run unit-tests      Ejecutar tests unitarios
+  update language-files   Actualizar archivos de idioma
+
+${BOLD}EJEMPLOS:${NORMAL}
+  $0 run unit-tests
+  $0 --verbose run checks
+  $0 --dry-run build deb
+  $0 --config /etc/lynis-sdk/config run linters
+
+${BOLD}VARIABLES DE ENTORNO:${NORMAL}
+  LYNIS_PATH          Ruta al directorio de Lynis (alternativa a config)
+
+EOF
 }
 
-# -- Programa principal -------------------------------------------------------
-main() {
-    _parse_args "$@"
-    _preflight_checks
-    _load_includes
-
-    _sep
-    printf "  ${BOLD}Lynis Development Kit${NORMAL}  v%s [%s]\n" "${DEVKIT_VERSION}" "${DEVKIT_RELEASE}"
-    printf "  Directorio Lynis : %s\n" "${LYNIS_PATH}"
-    printf "  Version Lynis    : %s\n" "${LYNIS_VERSION}"
-    printf "  Verbose          : %s\n" "${VERBOSE}"
-    printf "  Dry-run          : %s\n" "${DRY_RUN}"
-    printf "  Log              : %s\n" "${LOGFILE}"
-    _sep
-    printf "\n"
-
-    EXIT_CODE=0
-    case "${MODE}" in
-        build-all)              SDKBuildPackageDEB ; SDKBuildPackageRPM ;;
-        build-deb|build-dpkg)  SDKBuildPackageDEB ;;
-        build-rpm)             SDKBuildPackageRPM ;;
-        run-checks)            _run_checks         || EXIT_CODE=$? ;;
-        run-linters)           _run_linters        || EXIT_CODE=$? ;;
-        run-spelling-check)    _run_spelling_check || EXIT_CODE=$? ;;
-        run-unit-tests)        _run_unit_tests     || EXIT_CODE=$? ;;
-        update-language-files) _update_language_files || EXIT_CODE=$? ;;
-        do-nothing)            _show_help ;;
+################################################################################
+# PARSE DE FLAGS CLI
+# Se realiza ANTES de leer el config para que --help y --version funcionen
+# incluso si el archivo config no existe.
+################################################################################
+_RAW_ARGS="$*"
+while [ $# -ge 1 ]; do
+    case "$1" in
+        --help|-h)
+            _setup_colors
+            _show_help
+            exit 0
+        ;;
+        --version)
+            printf 'lynis-devkit %s (%s)\n' "${DEVKIT_VERSION}" "${DEVKIT_RELEASE}"
+            exit 0
+        ;;
+        --verbose|-v)
+            VERBOSE=1
+        ;;
+        --dry-run)
+            DRY_RUN=1
+        ;;
+        --config)
+            shift
+            [ $# -eq 0 ] && { printf 'Error: --config requiere un argumento\n' >&2; exit 1; }
+            CONFIG_FILE="$1"
+        ;;
+        build)
+            shift
+            [ $# -eq 0 ] && { printf 'Error: build requiere: deb | rpm | all\n' >&2; exit 1; }
+            case "$1" in
+                deb|dpkg) MODE="build-deb"  ;;
+                rpm)      MODE="build-rpm"  ;;
+                all)      MODE="build-all"  ;;
+                *) printf 'Error: subtarea build desconocida: %s\n' "$1" >&2; exit 1 ;;
+            esac
+        ;;
+        run)
+            shift
+            [ $# -eq 0 ] && { printf 'Error: run requiere una subtarea\n' >&2; exit 1; }
+            case "$1" in
+                checks)         MODE="run-checks"         ;;
+                linters)        MODE="run-linters"        ;;
+                spelling-check) MODE="run-spelling-check" ;;
+                unit-tests)     MODE="run-unit-tests"     ;;
+                *) printf 'Error: subtarea run desconocida: %s\n' "$1" >&2; exit 1 ;;
+            esac
+        ;;
+        update)
+            shift
+            [ $# -eq 0 ] && { printf 'Error: update requiere: language-files\n' >&2; exit 1; }
+            case "$1" in
+                language-files) MODE="update-language-files" ;;
+                *) printf 'Error: subtarea update desconocida: %s\n' "$1" >&2; exit 1 ;;
+            esac
+        ;;
+        *)
+            printf 'Error: opción desconocida: %s\n' "$1" >&2
+            printf 'Usa %s --help para ver las opciones disponibles.\n' "$0" >&2
+            exit 1
+        ;;
     esac
+    shift
+done
 
-    printf "\n"
-    if [ "${EXIT_CODE}" -eq 0 ]; then
-        _ok "Finalizado correctamente  |  Warnings: ${WARNINGS}"
+# --- Inicializar colores y logging ---
+_setup_colors
+_info "lynis-devkit ${DEVKIT_VERSION} iniciado (args: ${_RAW_ARGS:-ninguno})"
+if [ "${DRY_RUN}" -eq 1 ]; then _warn "Modo DRY-RUN activo: no se realizarán cambios reales"; fi
+
+# --- Validar usuario ---
+MY_USER_ID=$(id -u)
+if [ "${MY_USER_ID}" = "0" ]; then _fatal "No ejecutar como root"; fi
+
+# --- Leer config ---
+if [ ! -f "${CONFIG_FILE}" ]; then _fatal "No se puede abrir el archivo de config: ${CONFIG_FILE}"; fi
+_debug "Usando config: ${CONFIG_FILE}"
+
+# Verbose desde config (si no fue activado por --verbose)
+if [ "${VERBOSE}" -eq 0 ]; then
+    _cfg_verbose=$(_config_get "verbose" "no")
+    case "${_cfg_verbose}" in
+        [Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|1) VERBOSE=1 ;;
+    esac
+fi
+
+# Ruta de Lynis desde config (o variable de entorno LYNIS_PATH)
+if [ -z "${LYNIS_PATH:-}" ]; then
+    LYNIS_PATH=$(_config_get "lynis-directory" "")
+fi
+
+if [ -z "${LYNIS_PATH}" ] || [ ! -d "${LYNIS_PATH}" ]; then
+    _fatal "No se encontró el directorio de Lynis. Revisar 'lynis-directory' en ${CONFIG_FILE} o la variable LYNIS_PATH"
+fi
+
+if [ ! -f "${LYNIS_PATH}/lynis" ]; then
+    _fatal "No se encontró el binario Lynis en: ${LYNIS_PATH}/lynis"
+fi
+
+# --- Versión de Lynis ---
+LYNIS_VERSION=$(grep 'PROGRAM_VERSION=' "${LYNIS_PATH}/lynis" \
+    | head -1 \
+    | awk -F= '{print $2}' \
+    | sed 's/"//g' \
+    | sed "s/'//g" \
+    | tr -d '[:space:]')
+
+_debug "Lynis versión detectada: ${LYNIS_VERSION}"
+
+# Validar versión mínima de Lynis
+if ! _version_gte "${LYNIS_VERSION}" "${DEVKIT_MIN_LYNIS_VERSION}"; then
+    _warn "Lynis ${LYNIS_VERSION} es anterior a la versión mínima recomendada ${DEVKIT_MIN_LYNIS_VERSION}"
+fi
+
+# --- Banner ---
+printf '\n'
+printf '%s======================================================================%s\n' "${CYAN}" "${NORMAL}"
+printf '  Development kit:    %s%s%s [%s]\n' "${BOLD}" "${DEVKIT_VERSION}" "${NORMAL}" "${DEVKIT_RELEASE}"
+printf '  Lynis directory:    %s\n' "${LYNIS_PATH}"
+printf '  Lynis version:      %s\n' "${LYNIS_VERSION}"
+printf '  Verbose:            %s\n' "${VERBOSE}"
+printf '  Dry-run:            %s\n' "${DRY_RUN}"
+printf '  Mode:               %s\n' "${MODE}"
+printf '  Log:                %s\n' "${LOGFILE}"
+printf '%s======================================================================%s\n' "${CYAN}" "${NORMAL}"
+printf '\n'
+
+# --- Cargar funciones de Lynis ---
+FUNCTIONS_FILE="${LYNIS_PATH}/include/functions"
+if [ -f "${FUNCTIONS_FILE}" ]; then
+    _debug "Cargando funciones de Lynis: ${FUNCTIONS_FILE}"
+    # shellcheck source=/dev/null
+    . "${FUNCTIONS_FILE}"
+fi
+
+# --- Cargar funciones del SDK ---
+FUNCTIONS_FILE="./include/devkit-functions"
+if [ -f "${FUNCTIONS_FILE}" ]; then
+    _debug "Cargando funciones del SDK: ${FUNCTIONS_FILE}"
+    # shellcheck source=/dev/null
+    . "${FUNCTIONS_FILE}"
+fi
+
+# --- Cargar parámetros ---
+INCLUDE_FILES="./include/parameters"
+for FILE in ${INCLUDE_FILES}; do
+    if [ -f "${FILE}" ]; then
+        _debug "Incluyendo: ${FILE}"
+        # shellcheck source=/dev/null
+        . "${FILE}"
     else
-        _error "Finalizado con errores (codigo: ${EXIT_CODE})  |  Errors: ${ERRORS}  Warnings: ${WARNINGS}"
+        _fatal "No se encontró el archivo include requerido: ${FILE}"
     fi
-    return "${EXIT_CODE}"
-}
+done
 
-main "$@"
+# --- Ejecutar acción ---
+_info "Ejecutando modo: ${MODE}"
+
+case ${MODE} in
+    "build-all")
+        if [ "${DRY_RUN}" -eq 1 ]; then
+            _warn "[DRY-RUN] Se ejecutaría: SDKBuildPackageDEB && SDKBuildPackageRPM"
+        else
+            SDKBuildPackageDEB
+            SDKBuildPackageRPM
+        fi
+    ;;
+
+    "build-deb" | "build-dpkg")
+        if [ "${DRY_RUN}" -eq 1 ]; then
+            _warn "[DRY-RUN] Se ejecutaría: SDKBuildPackageDEB"
+        else
+            SDKBuildPackageDEB
+        fi
+    ;;
+
+    "build-rpm")
+        if [ "${DRY_RUN}" -eq 1 ]; then
+            _warn "[DRY-RUN] Se ejecutaría: SDKBuildPackageRPM"
+        else
+            SDKBuildPackageRPM
+        fi
+    ;;
+
+    "do-nothing")
+        _show_help
+    ;;
+
+    "run-checks")
+        _info "Ejecutando checks de calidad"
+        FILES=$(find ./checks -name 'check-*' -type f)
+        for FILE in ${FILES}; do
+            _debug "Check: ${FILE}"
+            # shellcheck source=/dev/null
+            . "${FILE}"
+            Assert
+            if [ $? -gt 0 ]; then
+                _err "[X] Uno o más checks fallaron en: ${FILE}"
+                exit 1
+            fi
+        done
+    ;;
+
+    "run-linters")
+        _info "Ejecutando linters"
+        if [ -d ./linters ]; then
+            FILES=$(find ./linters -type f -name 'linter-*')
+            for FILE in ${FILES}; do
+                InsertSection "Linter - ${FILE}"
+                _debug "Linter: ${FILE}"
+                # shellcheck source=/dev/null
+                . "${FILE}"
+            done
+        else
+            _warn "Directorio ./linters no encontrado"
+        fi
+    ;;
+
+    "run-spelling-check")
+        _info "Ejecutando comprobación ortográfica"
+        # shellcheck source=/dev/null
+        . "./grammar/grammar-check-spelling"
+    ;;
+
+    "run-unit-tests")
+        _info "Ejecutando tests unitarios"
+        _TESTS_PASSED=0
+        _TESTS_FAILED=0
+        FILES=$(find ./unit-tests -name 'tests-*' -type f)
+        for FILE in ${FILES}; do
+            _debug "Test suite: ${FILE}"
+            # shellcheck source=/dev/null
+            . "${FILE}"
+            Assert
+            _rc=$?
+            if [ "${_rc}" -gt 0 ]; then
+                _err "[X] Uno o más tests unitarios fallaron en: ${FILE}"
+                _TESTS_FAILED=$((_TESTS_FAILED + 1))
+            else
+                _TESTS_PASSED=$((_TESTS_PASSED + 1))
+            fi
+        done
+        printf '\n'
+        printf '%s--- Resultado final de tests ---%s\n' "${BOLD}" "${NORMAL}"
+        printf '  Suites pasadas:  %s%d%s\n' "${GREEN}" "${_TESTS_PASSED}" "${NORMAL}"
+        printf '  Suites fallidas: %s%d%s\n' "${RED}"   "${_TESTS_FAILED}" "${NORMAL}"
+        if [ "${_TESTS_FAILED}" -gt 0 ]; then exit 1; fi
+    ;;
+
+    "update-language-files")
+        _info "Actualizando archivos de idioma"
+        FILES=$(find ./languages -name 'languages-*' -type f)
+        for FILE in ${FILES}; do
+            _debug "Language file: ${FILE}"
+            # shellcheck source=/dev/null
+            . "${FILE}"
+            if [ "${DRY_RUN}" -eq 0 ]; then
+                UpdateLanguageFiles
+            else
+                _warn "[DRY-RUN] Se ejecutaría: UpdateLanguageFiles para ${FILE}"
+            fi
+        done
+    ;;
+esac
+
+printf '\n'
+Display --text 'End of Program' --result 'OK'
+_log "INFO " "lynis-devkit ${DEVKIT_VERSION} terminó correctamente (modo: ${MODE})"
+
 # EOF
